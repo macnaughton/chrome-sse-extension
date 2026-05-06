@@ -2,8 +2,6 @@
 
 A Chrome DevTools extension for capturing and inspecting Server-Sent Event streams. Built for debugging agentic chat apps and other SSE-heavy workflows.
 
-![SSE Inspector panel showing captured events](https://placeholder)
-
 ## Features
 
 - **Intercepts both transports** — `fetch`-based SSE (`text/event-stream`) and native `EventSource`
