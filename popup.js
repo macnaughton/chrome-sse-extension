@@ -7,6 +7,8 @@ let filterType = 'all';
 let filterStream = null;
 let searchQuery = '';
 let autoScroll = true;
+let persistEnabled = false;
+let freqVisible = true; // default, updated async on load
 
 const eventsList = document.getElementById('eventsList');
 const streamsBar = document.getElementById('streamsBar');
@@ -17,6 +19,10 @@ const statusDot = document.getElementById('statusDot');
 const statEvents = document.getElementById('statEvents');
 const statStreams = document.getElementById('statStreams');
 const scrollBottomBtn = document.getElementById('scrollBottomBtn');
+const exportBtn = document.getElementById('exportBtn');
+const persistToggle = document.getElementById('persistToggle');
+const frequencyBar = document.getElementById('frequencyBar');
+const freqBtn = document.getElementById('freqBtn');
 
 // --- Utilities ---
 
@@ -44,7 +50,8 @@ function tryParseJson(str) {
 }
 
 function syntaxHighlight(obj) {
-  const json = JSON.stringify(obj, null, 2);
+  const json = JSON.stringify(obj, null, 2)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
     if (/^"/.test(match)) {
       if (/:$/.test(match)) {
@@ -94,7 +101,8 @@ function renderStreams() {
     chip.className = 'stream-chip' + (filterStream === id ? ' active' : '');
     const dotClass = info.status === 'error' ? 'error' : info.status === 'closed' ? 'closed' : '';
     const transport = info.transport === 'fetch' ? '[fetch]' : '[es]';
-    chip.innerHTML = `<span class="dot ${dotClass}"></span> ${transport} ${shortUrl(info.url)} <span style="color:var(--text3)">${info.eventCount || 0}</span>`;
+    const latency = info.lastEventAt && !info.status ? ` · ${formatLatency(info.lastEventAt)}` : '';
+    chip.innerHTML = `<span class="dot ${dotClass}"></span> ${transport} ${shortUrl(info.url)} <span style="color:var(--text3)">${info.eventCount || 0}${latency}</span>`;
     chip.title = info.url;
     chip.onclick = () => { filterStream = filterStream === id ? null : id; renderStreams(); renderEvents(); };
     streamsBar.appendChild(chip);
@@ -106,17 +114,51 @@ function matchesFilter(event) {
   if (filterType === 'message' && event.eventType !== 'message') return false;
   if (filterType === 'custom' && event.eventType === 'message') return false;
   if (searchQuery) {
-    const q = searchQuery.toLowerCase();
-    const inData = event.data?.toLowerCase().includes(q);
-    const inUrl = event.url?.toLowerCase().includes(q);
-    const inType = event.eventType?.toLowerCase().includes(q);
-    if (!inData && !inUrl && !inType) return false;
+    const eqIdx = searchQuery.indexOf('=');
+    if (eqIdx > 0) {
+      const path = searchQuery.slice(0, eqIdx).trim();
+      const value = searchQuery.slice(eqIdx + 1).trim();
+      const parsed = tryParseJson(event.data);
+      if (!parsed || String(getNestedValue(parsed, path)) !== value) return false;
+    } else {
+      const q = searchQuery.toLowerCase();
+      const inData = event.data?.toLowerCase().includes(q);
+      const inUrl = event.url?.toLowerCase().includes(q);
+      const inType = event.eventType?.toLowerCase().includes(q);
+      if (!inData && !inUrl && !inType) return false;
+    }
   }
   return true;
 }
 
+function renderFrequency(filtered) {
+  if (!frequencyBar) return;
+  const counts = {};
+  filtered.forEach(e => {
+    const parsed = tryParseJson(e.data);
+    const key = (parsed?.type) || e.eventType || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  if (entries.length <= 1 || !freqVisible) { frequencyBar.classList.add('hidden'); return; }
+  frequencyBar.classList.remove('hidden');
+  frequencyBar.innerHTML = '';
+  const total = filtered.length;
+  entries.forEach(([type, count]) => {
+    const seg = document.createElement('div');
+    seg.className = 'freq-segment';
+    seg.style.flex = count;
+    seg.style.background = typeColor(type);
+    seg.title = `${type}: ${count} (${Math.round(count / total * 100)}%)`;
+    const pct = count / total;
+    seg.textContent = pct > 0.1 ? `${type} ${count}` : pct > 0.04 ? `${count}` : '';
+    frequencyBar.appendChild(seg);
+  });
+}
+
 function renderEvents() {
   const filtered = allEvents.filter(matchesFilter);
+  renderFrequency(filtered);
 
   statEvents.textContent = allEvents.length;
   statStreams.textContent = Object.keys(streams).length;
@@ -134,10 +176,16 @@ function renderEvents() {
     return;
   }
 
-  // Keep track of expanded items
+  // Keep track of expanded items and their scroll positions
   const expanded = new Set();
-  document.querySelectorAll('.event-item.expanded').forEach(el => expanded.add(el.dataset.id));
+  const rawScrollPositions = {};
+  document.querySelectorAll('.event-item.expanded').forEach(el => {
+    expanded.add(el.dataset.id);
+    const raw = el.querySelector('.event-raw');
+    if (raw) rawScrollPositions[el.dataset.id] = raw.scrollTop;
+  });
 
+  const prevScrollTop = eventsList.scrollTop;
   eventsList.innerHTML = '';
 
   filtered.forEach((event) => {
@@ -150,9 +198,6 @@ function renderEvents() {
 
     const badgeClass = event.eventType === 'message' ? 'message' : '';
     const preview = getPreview(event.data || '');
-    const formattedBody = parsed
-      ? `<div class="event-raw">${syntaxHighlight(parsed)}</div>`
-      : `<div class="event-raw">${escapeHtml(event.data || '')}</div>`;
 
     item.innerHTML = `
       <div class="event-header">
@@ -163,7 +208,7 @@ function renderEvents() {
         <span class="chevron">▶</span>
       </div>
       <div class="event-body">
-        ${formattedBody}
+        <div class="event-raw"></div>
         <div class="event-meta">
           <div class="meta-item">stream: <span>${escapeHtml(event.streamId || '')}</span></div>
           ${event.lastEventId ? `<div class="meta-item">id: <span>${escapeHtml(event.lastEventId)}</span></div>` : ''}
@@ -171,6 +216,13 @@ function renderEvents() {
         </div>
       </div>
     `;
+
+    const rawEl = item.querySelector('.event-raw');
+    if (parsed) {
+      renderJsonTree(parsed, rawEl);
+    } else {
+      rawEl.textContent = event.data || '';
+    }
 
     item.querySelector('.event-header').addEventListener('click', () => {
       item.classList.toggle('expanded');
@@ -186,10 +238,17 @@ function renderEvents() {
     });
 
     eventsList.appendChild(item);
+
+    if (rawScrollPositions[event.id]) {
+      const raw = item.querySelector('.event-raw');
+      if (raw) raw.scrollTop = rawScrollPositions[event.id];
+    }
   });
 
   if (autoScroll) {
     eventsList.scrollTop = eventsList.scrollHeight;
+  } else {
+    eventsList.scrollTop = prevScrollTop;
   }
 }
 
@@ -201,9 +260,93 @@ function escapeAttr(str) {
   return String(str).replace(/"/g, '&quot;');
 }
 
+function renderJsonTree(obj, container, depth = 0) {
+  if (depth > 12) {
+    const truncated = document.createElement('div');
+    truncated.className = 'json-row json-punct';
+    truncated.style.paddingLeft = `${depth * 14}px`;
+    truncated.textContent = '…';
+    container.appendChild(truncated);
+    return;
+  }
+  const isArr = Array.isArray(obj);
+  const entries = isArr ? obj.map((v, i) => [String(i), v]) : Object.entries(obj);
+  entries.forEach(([key, value]) => {
+    const row = document.createElement('div');
+    row.className = 'json-row';
+    row.style.paddingLeft = `${depth * 14}px`;
+
+    const keyEl = document.createElement('span');
+    keyEl.className = 'json-key';
+    keyEl.textContent = isArr ? key : `"${key}"`;
+    row.appendChild(keyEl);
+
+    const colon = document.createElement('span');
+    colon.className = 'json-punct';
+    colon.textContent = ': ';
+    row.appendChild(colon);
+
+    if (value !== null && typeof value === 'object') {
+      const open = Array.isArray(value) ? '[' : '{';
+      const close = Array.isArray(value) ? ']' : '}';
+      const bracket = document.createElement('span');
+      bracket.className = 'json-punct';
+      bracket.textContent = open;
+      row.appendChild(bracket);
+      container.appendChild(row);
+      renderJsonTree(value, container, depth + 1);
+      const closeRow = document.createElement('div');
+      closeRow.className = 'json-row json-punct';
+      closeRow.style.paddingLeft = `${depth * 14}px`;
+      closeRow.textContent = close;
+      container.appendChild(closeRow);
+    } else {
+      const valEl = document.createElement('span');
+      if (value === null) { valEl.className = 'json-null'; valEl.textContent = 'null'; }
+      else if (typeof value === 'boolean') { valEl.className = 'json-bool'; valEl.textContent = String(value); }
+      else if (typeof value === 'number') { valEl.className = 'json-number'; valEl.textContent = String(value); }
+      else { valEl.className = 'json-string'; valEl.textContent = JSON.stringify(value); }
+      row.appendChild(valEl);
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'field-copy-btn';
+      copyBtn.textContent = 'copy';
+      copyBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(value === null ? 'null' : String(value));
+        copyBtn.textContent = '✓';
+        setTimeout(() => { copyBtn.textContent = 'copy'; }, 1000);
+      });
+      row.appendChild(copyBtn);
+      container.appendChild(row);
+    }
+  });
+}
+
+function typeColor(type) {
+  let hash = 0;
+  for (let i = 0; i < type.length; i++) hash = (hash * 31 + type.charCodeAt(i)) & 0xffffffff;
+  return `hsl(${Math.abs(hash) % 360}, 60%, 42%)`;
+}
+
+function formatLatency(lastEventAt) {
+  if (!lastEventAt) return '';
+  const ms = Date.now() - lastEventAt;
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60000)}m`;
+}
+
+function getNestedValue(obj, path) {
+  return path.split('.').reduce((cur, key) => cur?.[key], obj);
+}
+
 // --- Data fetching ---
 
 async function getCurrentTabId() {
+  if (chrome.devtools?.inspectedWindow) {
+    return chrome.devtools.inspectedWindow.tabId;
+  }
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       resolve(tabs[0]?.id);
@@ -220,6 +363,8 @@ async function loadData() {
     allEvents = response.events || [];
     streams = response.streams || {};
     paused = response.paused || false;
+    persistEnabled = response.persistEnabled ?? false;
+    persistToggle.checked = persistEnabled;
 
     statusDot.className = 'status-dot' + (paused ? ' paused' : '');
     pauseBtn.textContent = paused ? 'Resume' : 'Pause';
@@ -270,6 +415,28 @@ scrollBottomBtn.addEventListener('click', () => {
   eventsList.scrollTop = eventsList.scrollHeight;
 });
 
+exportBtn.addEventListener('click', () => {
+  const filtered = allEvents.filter(matchesFilter);
+  const ndjson = filtered.map(e => JSON.stringify(e)).join('\n');
+  navigator.clipboard.writeText(ndjson).then(() => {
+    exportBtn.textContent = 'Copied!';
+    setTimeout(() => { exportBtn.textContent = 'Export'; }, 1500);
+  });
+});
+
+persistToggle.addEventListener('change', () => {
+  persistEnabled = persistToggle.checked;
+  chrome.runtime.sendMessage({ type: 'set_persist', enabled: persistEnabled });
+});
+
+freqBtn.classList.toggle('active', freqVisible);
+freqBtn.addEventListener('click', () => {
+  freqVisible = !freqVisible;
+  chrome.storage.local.set({ freqVisible });
+  freqBtn.classList.toggle('active', freqVisible);
+  renderEvents();
+});
+
 eventsList.addEventListener('scroll', () => {
   const atBottom = eventsList.scrollHeight - eventsList.scrollTop - eventsList.clientHeight < 40;
   autoScroll = atBottom;
@@ -277,9 +444,11 @@ eventsList.addEventListener('scroll', () => {
 
 // --- Live updates ---
 
+let updateDebounceTimer = null;
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'update' && message.tabId === tabId) {
-    loadData();
+    clearTimeout(updateDebounceTimer);
+    updateDebounceTimer = setTimeout(loadData, 80);
   }
 });
 
@@ -289,4 +458,10 @@ chrome.runtime.onMessage.addListener((message) => {
   tabId = await getCurrentTabId();
   await loadData();
   setInterval(loadData, 1500); // fallback poll
+  chrome.storage.local.get('freqVisible', (r) => {
+    freqVisible = r.freqVisible ?? true;
+    freqBtn.classList.toggle('active', freqVisible);
+    renderEvents();
+  });
 })();
+
